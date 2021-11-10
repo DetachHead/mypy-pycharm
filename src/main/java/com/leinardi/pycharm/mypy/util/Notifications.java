@@ -101,6 +101,12 @@ public final class Notifications {
                 .setListener(URL_OPENING_LISTENER)
                 .notify(project);
     }
+    public static void showInfo2(final Project project, final String subt) {
+        LOG_ONLY_GROUP
+                .createNotification("MYPY INFO: " + subt, INFORMATION)
+                .setListener(URL_OPENING_LISTENER)
+                .notify(project);
+    }
 
     public static void showInstallMypy(final Project project) {
         Notification notification = BALLOON_GROUP

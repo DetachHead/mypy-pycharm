@@ -17,10 +17,17 @@
 package com.leinardi.pycharm.mypy.util;
 
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.progress.ProcessCanceledException;
 import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ProjectManager;
+import com.leinardi.pycharm.mypy.MypyInspection;
+import com.leinardi.pycharm.mypy.checker.Problem;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 
@@ -47,7 +54,12 @@ public class Async {
 
     public static <T> Future<T> whenFinished(final Future<T> future) {
         while (!future.isDone() && !future.isCancelled()) {
-            ProgressManager.checkCanceled();
+            try {
+                ProgressManager.checkCanceled();
+            } catch (ProcessCanceledException e) {
+                future.cancel(true);
+                throw e;
+            }
             waitFor(FIFTY_MS);
         }
         return future;

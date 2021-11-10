@@ -56,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -279,11 +280,12 @@ public class MypyRunner {
             mypyPath = Paths.get(p.getParent().toString(), dFile).toString();
         }
 
-        GeneralCommandLine cmd = new GeneralCommandLine(mypyPath);
-        cmd.setCharset(UTF_8);
+        GeneralCommandLine cmd = new GeneralCommandLine(mypyPath)
+            .withCharset(UTF_8)
+            .withWorkDirectory(project.getBasePath());
+
         if (mypyConfigService.isUseDaemon()) {
-            cmd.addParameter("run");
-            cmd.addParameter("--");
+            cmd.addParameters("run", "--");
         }
 
         cmd.addParameter("--show-column-numbers");
@@ -291,8 +293,7 @@ public class MypyRunner {
         injectEnvironmentVariables(project, cmd);
 
         if (!mypyConfigFilePath.isEmpty()) {
-            cmd.addParameter("--config-file");
-            cmd.addParameter(mypyConfigFilePath);
+            cmd.addParameters("--config-file", mypyConfigFilePath);
         }
 
         ParametersList parametersList = cmd.getParametersList();
@@ -301,31 +302,95 @@ public class MypyRunner {
         for (String file : filesToScan) {
             cmd.addParameter(file);
         }
-        cmd.setWorkDirectory(project.getBasePath());
 
         LOG.debug("Command Line string: " + cmd.getCommandLineString());
         try {
-            final int retryLimit = 5;
+            final int retryLimit = 6;
             InputStream inputStream = null;
             for (int retryCount = 1; retryCount <= retryLimit; retryCount++) {
-                final Process process = cmd.createProcess();
-                inputStream = process.getInputStream();
-
-                String error = new BufferedReader(new InputStreamReader(process.getErrorStream(), UTF_8))
-                        .lines().collect(Collectors.joining("\n"));
-                if (StringUtil.isEmpty(error)) {
-                    break;
-                } else {
-                    LOG.info("Command Line string: " + cmd.getCommandLineString());
-                    // "The connection is busy." - the daemon sometimes fails when idea invokes the inspection multiple times
-                    // the rest of the errors seem to be the daemon itself being extremely flaky
-                    if (mypyConfigService.isUseDaemon() &&
-                            (error.equals("The connection is busy.") || error.equals("Timed out waiting for daemon to start") || error.startsWith("Daemon crashed!"))) {
-                        LOG.warn(error + " attempt #" + retryCount);
-                    } else {
-                        throw new MypyToolException("Error while running Mypy: " + error);
-                    }
+                if (retryCount == retryLimit) {
+                    throw new MypyToolException("Giving up");
                 }
+                Notifications.showInfo2(project, "Starting attempt #" + retryCount + ": " + cmd.getCommandLineString());
+                final Process process = cmd.createProcess();
+
+                inputStream = process.getInputStream();
+                final String finalMypyPath = mypyPath;
+                // check daemon status
+                var stat = new Runnable() {
+                    boolean stop = false;
+                    @Override
+                    public void run() {
+                        try {
+                            if (mypyConfigService.isUseDaemon()) {
+                                process.waitFor(2, TimeUnit.SECONDS);
+                                if (stop) return;
+                                // check if it's hanging
+                                if (process.getInputStream().available() == 0) {
+                                    GeneralCommandLine status = new GeneralCommandLine(finalMypyPath, "status").withWorkDirectory(project.getBasePath()).withCharset(UTF_8);
+                                    Process sp = status.createProcess();
+                                    BufferedReader err = new BufferedReader(new InputStreamReader(sp.getErrorStream(), UTF_8));
+                                    BufferedReader out = new BufferedReader(new InputStreamReader(sp.getInputStream(), UTF_8));
+                                    sp.waitFor();
+                                    if (stop) return;
+                                    var s = "cmd: " + status.getCommandLineString() + "\nout:" + out.lines().collect(Collectors.joining("\n")) + "\nerr:" + err.lines().collect(Collectors.joining("\n"));
+                                    Notifications.showInfo2(project, "dmypy status: " + s);
+                                    if (sp.exitValue() != 0) {
+                                        Notifications.showInfo2(project, "dmypy status showed an error, killing dmypy");
+                                        GeneralCommandLine kill = new GeneralCommandLine(finalMypyPath, "kill")
+                                            .withCharset(UTF_8)
+                                            .withWorkDirectory(project.getBasePath());
+                                        Process kp = kill.createProcess();
+                                        BufferedReader kout = new BufferedReader(new InputStreamReader(sp.getErrorStream(), UTF_8));
+                                        BufferedReader kerr = new BufferedReader(new InputStreamReader(sp.getInputStream(), UTF_8));
+                                        if (stop) return;
+                                        kp.waitFor();
+                                        var ks = "cmd: " + kill.getCommandLineString() + "\nout:" + kout.lines().collect(Collectors.joining("\n")) + "\nerr:" + kerr.lines().collect(Collectors.joining("\n"));
+                                        Notifications.showInfo2(project, "dmypy kill: " + ks);
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                };
+                var t = new Thread(stat);
+                t.start();
+                String error;
+                try {
+                     error = new BufferedReader(new InputStreamReader(process.getErrorStream(), UTF_8))
+                            .lines().collect(Collectors.joining("\n"));
+                } catch (Throwable thr) {
+                    LOG.warn("caught a " + thr);
+                    stat.stop = true;
+                    process.destroyForcibly();
+                    throw thr;
+                }
+                if (StringUtil.isEmpty(error)) {
+                    Notifications.showInfo2(project, "Success at attempt #" + retryCount);
+                    break;
+                }
+                stat.stop = true;
+                Notifications.showInfo2(project, "Got an error at attempt #" + retryCount + ":\n" + error);
+
+                LOG.info("Command Line string: " + cmd.getCommandLineString());
+                // "The connection is busy." - the daemon sometimes fails when idea invokes the inspection multiple times
+                // the rest of the errors seem to be the daemon itself being extremely flaky
+                if (mypyConfigService.isUseDaemon()) {
+                    if (error.equals("The connection is busy.")
+                                || error.equals("Timed out waiting for daemon to start")
+                                || error.startsWith("Daemon crashed!")) {
+                        LOG.warn(error + " attempt #" + retryCount);
+                    }
+                    // TODO: fix this
+                    if (error.startsWith("The NamedPipe at")) {
+                        LOG.warn(error + " attempt #" + retryCount);
+                        Notifications.showInfo2(project, "NamedPipe error at attempt #" + retryCount + ": ");
+                    }
+                    continue;
+                }
+                throw new MypyToolException("Unknown error while running Mypy: " + error);
             }
 
             //  process.waitFor();
